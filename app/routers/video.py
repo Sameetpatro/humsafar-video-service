@@ -1,11 +1,4 @@
 # video_service/app/routers/video.py
-# FIXED VERSION:
-#   - 480p output (was 1080p → OOM-killed on Render free tier)
-#   - ultrafast preset, crf=28 (was fast/23 → too slow for free tier)
-#   - Aggressive logging at every step so you can see exactly where it dies
-#   - Proper error propagation so Android gets a "failed" status instead of hanging
-#   - Uses Unsplash API for images (free, no auth needed for small sizes)
-#   - Falls back to colored placeholder if image fetch fails
 
 import asyncio
 import hashlib
@@ -31,38 +24,33 @@ SUPABASE_BUCKET      = os.getenv("SUPABASE_BUCKET", "videos")
 SARVAM_API_KEY       = os.getenv("SARVAM_API_KEY", "")
 OPENROUTER_API_KEY   = os.getenv("OPENROUTER_API_KEY", "")
 
-# FFmpeg settings — tuned for Render free tier (512 MB RAM, shared CPU)
-FFMPEG_RESOLUTION = "854:480"   # 480p — ~4x less memory than 1080p
-FFMPEG_PRESET     = "ultrafast" # fastest encode, larger file but won't OOM
-FFMPEG_CRF        = "30"        # slightly lower quality = smaller file
-FFMPEG_TIMEOUT    = 180         # 3 min max for FFmpeg
+FFMPEG_RESOLUTION = "854:480"
+FFMPEG_PRESET     = "ultrafast"
+FFMPEG_CRF        = "30"
+FFMPEG_TIMEOUT    = 180
 
 router = APIRouter(tags=["video"])
-
-# Single worker — prevents two concurrent FFmpeg jobs from OOM-killing each other
 _ffmpeg_pool = ThreadPoolExecutor(max_workers=1)
-
-# In-memory job state
 _jobs: dict[str, dict] = {}
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class GenerateVideoRequest(BaseModel):
-    bot_text:      str           # The text to narrate (from chatbot response)
+    bot_text:      str
     site_name:     str
-    site_id:       str           # Used for image search
+    site_id:       str
     language_code: str = "en-IN"
 
 
 class GenerateVideoResponse(BaseModel):
-    job_id:    str
-    status:    str = "generating"
+    job_id: str
+    status: str = "generating"
 
 
 class VideoStatusResponse(BaseModel):
     job_id:    str
-    status:    str               # "generating" | "ready" | "failed"
+    status:    str
     progress:  int = 0
     video_url: str | None = None
     message:   str = ""
@@ -76,12 +64,11 @@ def _make_job_id(bot_text: str, site_id: str) -> str:
 
 
 def _update_job(job_id: str, **kwargs):
-    """Update job state and log it."""
     _jobs.setdefault(job_id, {}).update(kwargs)
-    status   = _jobs[job_id].get("status", "?")
-    progress = _jobs[job_id].get("progress", 0)
-    message  = _jobs[job_id].get("message", "")
-    logger.info(f"[Job/{job_id}] {status} {progress}% — {message}")
+    s = _jobs[job_id].get("status", "?")
+    p = _jobs[job_id].get("progress", 0)
+    m = _jobs[job_id].get("message", "")
+    logger.info(f"[Job/{job_id}] {s} {p}% — {m}")
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -93,7 +80,6 @@ async def generate_video(req: GenerateVideoRequest, background_tasks: Background
     job_id = _make_job_id(req.bot_text, req.site_id)
     logger.info(f"[/generate] job_id={job_id}")
 
-    # Cache hit — already generated
     existing = _jobs.get(job_id)
     if existing:
         if existing.get("status") == "ready":
@@ -102,7 +88,6 @@ async def generate_video(req: GenerateVideoRequest, background_tasks: Background
         if existing.get("status") == "generating":
             logger.info(f"[/generate] Already generating job_id={job_id}")
             return GenerateVideoResponse(job_id=job_id, status="generating")
-        # Failed — allow retry
         logger.info(f"[/generate] Retrying failed job_id={job_id}")
 
     _update_job(job_id, status="generating", progress=0, message="Queued")
@@ -114,7 +99,6 @@ async def generate_video(req: GenerateVideoRequest, background_tasks: Background
         site_id       = req.site_id,
         language_code = req.language_code,
     )
-
     return GenerateVideoResponse(job_id=job_id, status="generating")
 
 
@@ -148,38 +132,27 @@ async def _run_pipeline(
     tmp_mp4 = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_mp4.close()
     output_path = tmp_mp4.name
-    logger.info(f"[Pipeline/{job_id}] Output path: {output_path}")
 
     try:
         # ── Stage 1: TTS ─────────────────────────────────────────────────
-        logger.info(f"[Pipeline/{job_id}] Stage 1: TTS — {len(bot_text)} chars")
+        logger.info(f"[Pipeline/{job_id}] Stage 1: TTS")
         _update_job(job_id, progress=10, message="Generating narration audio…")
-
         wav_bytes = await _tts(bot_text, language_code)
         logger.info(f"[Pipeline/{job_id}] TTS done — {len(wav_bytes):,} bytes in {time.time()-t_start:.1f}s")
         _update_job(job_id, progress=30, message="Audio ready")
 
         # ── Stage 2: Images ───────────────────────────────────────────────
-        logger.info(f"[Pipeline/{job_id}] Stage 2: Fetching images for '{site_name}'")
+        logger.info(f"[Pipeline/{job_id}] Stage 2: Images")
         _update_job(job_id, progress=35, message="Fetching images…")
-
         image_paths = await _get_images(site_name, job_id)
         logger.info(f"[Pipeline/{job_id}] Images: {image_paths}")
         _update_job(job_id, progress=50, message=f"Got {len(image_paths)} images")
 
         # ── Stage 3: FFmpeg ───────────────────────────────────────────────
-        logger.info(f"[Pipeline/{job_id}] Stage 3: FFmpeg encode")
+        logger.info(f"[Pipeline/{job_id}] Stage 3: FFmpeg")
         _update_job(job_id, progress=55, message="Rendering video (480p ultrafast)…")
-
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            _ffmpeg_pool,
-            _run_ffmpeg_sync,
-            job_id,
-            image_paths,
-            wav_bytes,
-            output_path,
-        )
+        await loop.run_in_executor(_ffmpeg_pool, _run_ffmpeg_sync, job_id, image_paths, wav_bytes, output_path)
 
         if not os.path.exists(output_path):
             raise RuntimeError("FFmpeg finished but output file missing")
@@ -188,12 +161,11 @@ async def _run_pipeline(
         logger.info(f"[Pipeline/{job_id}] FFmpeg done — {size:,} bytes in {time.time()-t_start:.1f}s")
         _update_job(job_id, progress=75, message="Video rendered, uploading…")
 
-        # ── Stage 4: Upload to Supabase ───────────────────────────────────
+        # ── Stage 4: Upload ───────────────────────────────────────────────
         logger.info(f"[Pipeline/{job_id}] Stage 4: Supabase upload")
         public_url = await _upload_supabase(output_path, job_id)
         logger.info(f"[Pipeline/{job_id}] Upload done → {public_url} in {time.time()-t_start:.1f}s")
 
-        # ── Done ──────────────────────────────────────────────────────────
         total = time.time() - t_start
         logger.info(f"[Pipeline/{job_id}] ===== COMPLETE in {total:.1f}s ===== URL={public_url}")
         _update_job(job_id, status="ready", progress=100, video_url=public_url, message="Done")
@@ -216,12 +188,11 @@ async def _tts(text: str, language_code: str) -> bytes:
     if not SARVAM_API_KEY:
         raise RuntimeError("SARVAM_API_KEY not set")
 
-    # Truncate to 500 chars (Sarvam limit)
     if len(text) > 500:
         text = text[:500].rsplit(" ", 1)[0] + "…"
         logger.warning(f"[TTS] Truncated text to {len(text)} chars")
 
-    logger.info(f"[TTS] POST to Sarvam, {len(text)} chars, lang={language_code}")
+    logger.info(f"[TTS] POST to Sarvam, {len(text)} chars, lang={language_code}, speaker=anushka, model=bulbul:v3")
 
     async with httpx.AsyncClient(timeout=40.0) as client:
         resp = await client.post(
@@ -233,7 +204,7 @@ async def _tts(text: str, language_code: str) -> bytes:
             json={
                 "inputs":               [text],
                 "target_language_code": language_code,
-                "speaker":              "meera",
+                "speaker":              "anushka",   # valid bulbul:v3 speaker
                 "model":                "bulbul:v3",
             },
         )
@@ -246,26 +217,21 @@ async def _tts(text: str, language_code: str) -> bytes:
     if not audios:
         raise RuntimeError("Sarvam TTS returned empty audio list")
 
-    return base64.b64decode(audios[0])
+    wav = base64.b64decode(audios[0])
+    logger.info(f"[TTS] Got {len(wav):,} bytes of audio")
+    return wav
 
 
 # ── Images ────────────────────────────────────────────────────────────────────
 
 async def _get_images(site_name: str, job_id: str) -> list[str]:
-    """
-    Download 3 images from Picsum (free, no API key needed).
-    Uses deterministic seeds based on site_name so same site gets same images.
-    Falls back to colored placeholder JPEGs if download fails.
-    """
     tmp_dir = tempfile.mkdtemp(prefix=f"imgs_{job_id}_")
     paths   = []
-
-    # Try Picsum Photos (free, no auth, reliable)
-    seeds = [abs(hash(site_name + str(i))) % 1000 for i in range(3)]
+    seeds   = [abs(hash(site_name + str(i))) % 1000 for i in range(3)]
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         for i, seed in enumerate(seeds):
-            url = f"https://picsum.photos/seed/{seed}/854/480"
+            url      = f"https://picsum.photos/seed/{seed}/854/480"
             img_path = os.path.join(tmp_dir, f"img_{i:02d}.jpg")
             try:
                 logger.info(f"[Images/{job_id}] Downloading image {i+1}/3 seed={seed}")
@@ -276,9 +242,9 @@ async def _get_images(site_name: str, job_id: str) -> list[str]:
                     paths.append(img_path)
                     logger.info(f"[Images/{job_id}] Image {i+1} downloaded: {len(r.content):,} bytes")
                 else:
-                    logger.warning(f"[Images/{job_id}] Picsum returned {r.status_code} for seed={seed}")
+                    logger.warning(f"[Images/{job_id}] Picsum returned {r.status_code}")
             except Exception as e:
-                logger.warning(f"[Images/{job_id}] Image download failed: {e}")
+                logger.warning(f"[Images/{job_id}] Download failed: {e}")
 
     if not paths:
         logger.warning(f"[Images/{job_id}] All downloads failed — using placeholder")
@@ -290,7 +256,6 @@ async def _get_images(site_name: str, job_id: str) -> list[str]:
 
 
 def _write_placeholder_jpg(path: str):
-    """Minimal valid black 1x1 JPEG."""
     data = bytes([
         0xFF,0xD8,0xFF,0xE0,0x00,0x10,0x4A,0x46,0x49,0x46,0x00,0x01,
         0x01,0x00,0x00,0x01,0x00,0x01,0x00,0x00,0xFF,0xDB,0x00,0x43,
@@ -310,19 +275,16 @@ def _write_placeholder_jpg(path: str):
         f.write(data)
 
 
-# ── FFmpeg (sync, runs in thread pool) ───────────────────────────────────────
+# ── FFmpeg ────────────────────────────────────────────────────────────────────
 
 def _run_ffmpeg_sync(job_id: str, image_paths: list[str], audio_bytes: bytes, output_path: str):
-    logger.info(f"[FFmpeg/{job_id}] Starting — {len(image_paths)} images, output={output_path}")
+    logger.info(f"[FFmpeg/{job_id}] Starting — {len(image_paths)} images")
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Write audio
         audio_path = os.path.join(tmp, "audio.wav")
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
-        logger.info(f"[FFmpeg/{job_id}] Audio written: {len(audio_bytes):,} bytes")
 
-        # Probe duration
         try:
             probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -336,9 +298,7 @@ def _run_ffmpeg_sync(job_id: str, image_paths: list[str], audio_bytes: bytes, ou
             duration = 20.0
 
         dur_per_img = max(duration / len(image_paths), 2.0)
-        logger.info(f"[FFmpeg/{job_id}] {len(image_paths)} images @ {dur_per_img:.1f}s each")
 
-        # Concat list
         concat = os.path.join(tmp, "concat.txt")
         with open(concat, "w") as f:
             for p in image_paths:
@@ -348,8 +308,7 @@ def _run_ffmpeg_sync(job_id: str, image_paths: list[str], audio_bytes: bytes, ou
 
         vf = (
             f"scale={FFMPEG_RESOLUTION}:force_original_aspect_ratio=decrease,"
-            f"pad={FFMPEG_RESOLUTION}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"setsar=1"
+            f"pad={FFMPEG_RESOLUTION}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         )
 
         cmd = [
@@ -357,29 +316,19 @@ def _run_ffmpeg_sync(job_id: str, image_paths: list[str], audio_bytes: bytes, ou
             "-f", "concat", "-safe", "0", "-i", concat,
             "-i", audio_path,
             "-vf", vf,
-            "-c:v", "libx264",
-            "-preset", FFMPEG_PRESET,
-            "-crf", FFMPEG_CRF,
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
             "-c:a", "aac", "-b:a", "96k",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            "-shortest",
-            "-r", "24",
+            "-shortest", "-r", "24",
             output_path,
         ]
 
-        logger.info(f"[FFmpeg/{job_id}] Running: {' '.join(cmd)}")
+        logger.info(f"[FFmpeg/{job_id}] Running ffmpeg…")
         t0 = time.time()
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=FFMPEG_TIMEOUT
-        )
-
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
         elapsed = time.time() - t0
-        logger.info(f"[FFmpeg/{job_id}] Exit code: {result.returncode} in {elapsed:.1f}s")
+        logger.info(f"[FFmpeg/{job_id}] Exit {result.returncode} in {elapsed:.1f}s")
 
         if result.returncode != 0:
             stderr = result.stderr[-3000:]
@@ -397,7 +346,7 @@ async def _upload_supabase(local_path: str, job_id: str) -> str:
         raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY not set")
 
     object_path = f"generated/{job_id}.mp4"
-    logger.info(f"[Supabase/{job_id}] Uploading to bucket={SUPABASE_BUCKET} path={object_path}")
+    logger.info(f"[Supabase/{job_id}] Uploading → bucket={SUPABASE_BUCKET} path={object_path}")
 
     with open(local_path, "rb") as f:
         data = f.read()
