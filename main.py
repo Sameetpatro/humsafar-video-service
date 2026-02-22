@@ -27,6 +27,11 @@ app.add_middleware(
 app.include_router(voice_router.router)
 app.include_router(video_proxy_router.router)
 
+# Replies longer than this word count get flagged so the frontend
+# can offer the "Watch as Video" button.
+VIDEO_THRESHOLD_WORDS = 60
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     system_prompt = f"""
@@ -40,10 +45,17 @@ async def chat(req: ChatRequest):
     - Do not hallucinate unknown facts.
     """
     messages  = [{"role": "system", "content": system_prompt}]
-    messages += req.history
+    messages += [{"role": m.role, "content": m.content} for m in req.history]
     messages.append({"role": "user", "content": req.message})
+
     reply = await call_openrouter(messages)
-    return ChatResponse(reply=reply)
+
+    # Tell the frontend whether this reply is long enough to offer a video
+    word_count    = len(reply.split())
+    suggest_video = word_count >= VIDEO_THRESHOLD_WORDS
+
+    return ChatResponse(reply=reply, suggest_video=suggest_video)
+
 
 @app.get("/health")
 async def health():
