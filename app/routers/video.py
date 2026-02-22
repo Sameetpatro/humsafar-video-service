@@ -192,7 +192,7 @@ async def _tts(text: str, language_code: str) -> bytes:
         text = text[:500].rsplit(" ", 1)[0] + "…"
         logger.warning(f"[TTS] Truncated text to {len(text)} chars")
 
-    logger.info(f"[TTS] POST to Sarvam, {len(text)} chars, lang={language_code}, speaker=anushka, model=bulbul:v3")
+    logger.info(f"[TTS] POST to Sarvam, {len(text)} chars, lang={language_code}, speaker=shreya, model=bulbul:v3")
 
     async with httpx.AsyncClient(timeout=40.0) as client:
         resp = await client.post(
