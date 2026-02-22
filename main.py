@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.models   import ChatRequest, ChatResponse
 from app.services import call_openrouter
 from app.routers  import voice as voice_router
+from app.routers  import video as video_router          # ← ADD THIS
 from app.routers  import video_proxy as video_proxy_router
 
 logging.basicConfig(
@@ -16,7 +17,7 @@ logging.basicConfig(
     datefmt = "%H:%M:%S",
 )
 
-app = FastAPI(title="Humsafar API", version="4.0.0")
+app = FastAPI(title="Humsafar Video Service", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +26,7 @@ app.add_middleware(
 )
 
 app.include_router(voice_router.router)
+app.include_router(video_router.router)         # ← ADD THIS — mounts /generate and /status/{id}
 app.include_router(video_proxy_router.router)
 
 # Replies longer than this word count get flagged so the frontend
@@ -50,7 +52,6 @@ async def chat(req: ChatRequest):
 
     reply = await call_openrouter(messages)
 
-    # Tell the frontend whether this reply is long enough to offer a video
     word_count    = len(reply.split())
     suggest_video = word_count >= VIDEO_THRESHOLD_WORDS
 
@@ -59,4 +60,9 @@ async def chat(req: ChatRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "humsafar-backend"}
+    return {"status": "ok", "service": "humsafar-video-service"}
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "humsafar-video-service", "endpoints": ["/generate", "/status/{job_id}", "/health"]}
