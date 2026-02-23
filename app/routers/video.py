@@ -30,6 +30,11 @@ FFMPEG_TIMEOUT    = 180
 TTS_SPEAKER = "ritu"
 TTS_MODEL   = "bulbul:v3"
 
+# Minimum duration per image in seconds
+MIN_DURATION_PER_IMAGE = 3.0
+# Minimum total video duration
+MIN_VIDEO_DURATION = 15.0
+
 router = APIRouter(tags=["video"])
 _ffmpeg_pool = ThreadPoolExecutor(max_workers=1)
 _jobs: dict[str, dict] = {}
@@ -174,137 +179,46 @@ async def _tts(text: str, language_code: str) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image fetching — Wikimedia Commons
+# Image fetching — Picsum (Placeholder for demo)
 #
-# Strategy (3 attempts, each progressively broader):
-#   1. Search "<site_name> India heritage" on Wikimedia Commons
-#      → returns actual photos of the monument from Wikipedia articles
-#   2. Search "<site_name>" alone
-#      → catches cases where "India heritage" narrows results too much
-#   3. Google Images open-source fallback via Wikimedia "File:" namespace
-#
-# Why Wikimedia Commons:
-#   - Free, no API key, no rate limit for small traffic
-#   - Contains the exact same high-quality photos used in Wikipedia articles
-#   - Images are correctly tagged (e.g. "Taj Mahal", "Qutub Minar") — not random
-#   - Reliable CDN (upload.wikimedia.org) — no auth, no CORS
+# Using Lorem Picsum for demo purposes - generates random placeholder images
+# In production, this should be replaced with actual Wikimedia Commons or
+# site-specific image fetching
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _get_images(site_name: str, job_id: str) -> list[str]:
     """
-    Fetch 3–4 contextually relevant images of the heritage site.
+    Fetch 3–4 placeholder images using Picsum.
     Returns a list of local temp file paths (JPEG).
-    Falls back to a placeholder only if every attempt fails.
+    This is a DEMO implementation - replace with real image sources in production.
     """
     tmp_dir = tempfile.mkdtemp(prefix=f"imgs_{job_id}_")
-
-    # Try Wikimedia Commons with progressively simpler queries
-    search_queries = [
-        f"{site_name} India heritage",
-        f"{site_name} India",
-        site_name,
+    
+    logger.info(f"[Images/{job_id}] Using Picsum placeholder images for demo (site: {site_name})")
+    
+    # Picsum URLs - different seed for variety
+    picsum_urls = [
+        f"https://picsum.photos/seed/{job_id}-{i}/854/480" 
+        for i in range(4)
     ]
-
-    image_urls: list[str] = []
+    
+    paths: list[str] = []
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        for query in search_queries:
-            if len(image_urls) >= 4:
-                break
-            urls = await _wikimedia_image_urls(client, query, wanted=4)
-            # Extend without duplicates
-            for u in urls:
-                if u not in image_urls:
-                    image_urls.append(u)
-            if image_urls:
-                logger.info(f"[Images/{job_id}] Wikimedia query '{query}' → {len(image_urls)} URL(s)")
-
-        # Download each URL
-        paths: list[str] = []
-        for i, url in enumerate(image_urls[:4]):
+        for i, url in enumerate(picsum_urls):
             dest = os.path.join(tmp_dir, f"img_{i:02d}.jpg")
             ok = await _download_image(client, url, dest)
             if ok:
                 paths.append(dest)
-                logger.info(f"[Images/{job_id}] Downloaded [{i}]: {url[:80]}")
-
+                logger.info(f"[Images/{job_id}] Downloaded Picsum image [{i}]")
+    
     if paths:
         return paths
-
+    
     # Last resort: placeholder
-    logger.warning(f"[Images/{job_id}] All Wikimedia attempts failed — using placeholder")
+    logger.warning(f"[Images/{job_id}] All Picsum downloads failed — using embedded placeholder")
     placeholder = os.path.join(tmp_dir, "placeholder.jpg")
     _write_placeholder_jpg(placeholder)
     return [placeholder]
-
-
-async def _wikimedia_image_urls(
-    client: httpx.AsyncClient,
-    query:  str,
-    wanted: int = 4
-) -> list[str]:
-    """
-    Query the Wikimedia Commons API for images matching `query`.
-    Returns up to `wanted` direct image URLs (JPEG/JPG only).
-
-    API used: MediaWiki action=query, generator=search, prop=imageinfo
-    This is the same API Wikipedia itself uses — no key required.
-    """
-    encoded_query = urllib.parse.quote(query)
-    api_url = (
-        "https://commons.wikimedia.org/w/api.php"
-        "?action=query"
-        "&format=json"
-        f"&generator=search"
-        f"&gsrsearch=File:{encoded_query}"   # restrict to File: namespace (images)
-        f"&gsrnamespace=6"                    # namespace 6 = File
-        f"&gsrlimit={wanted * 3}"            # fetch 3× wanted to allow filtering
-        "&prop=imageinfo"
-        "&iiprop=url|mime|size"
-        "&iiurlwidth=854"                     # request 854px wide thumbnail — matches video width
-        "&origin=*"
-    )
-
-    try:
-        resp = await client.get(api_url, timeout=15.0)
-        if resp.status_code != 200:
-            logger.warning(f"[Wikimedia] HTTP {resp.status_code} for query '{query}'")
-            return []
-
-        data  = resp.json()
-        pages = data.get("query", {}).get("pages", {})
-
-        urls: list[str] = []
-        for page in pages.values():
-            info_list = page.get("imageinfo", [])
-            if not info_list:
-                continue
-            info = info_list[0]
-
-            # Skip non-JPEG (SVG diagrams, maps, logos, audio files)
-            mime = info.get("mime", "")
-            if mime not in ("image/jpeg", "image/jpg"):
-                continue
-
-            # Skip very small images (icons, thumbnails < 200px wide)
-            width = info.get("width", 0)
-            if width < 300:
-                continue
-
-            # Prefer the resized thumbnail URL (854px) if available
-            thumb_url = info.get("thumburl", "")
-            orig_url  = info.get("url", "")
-            url = thumb_url if thumb_url else orig_url
-            if url:
-                urls.append(url)
-            if len(urls) >= wanted:
-                break
-
-        logger.debug(f"[Wikimedia] '{query}' → {len(urls)} JPEG URL(s)")
-        return urls
-
-    except Exception as e:
-        logger.warning(f"[Wikimedia] Exception for query '{query}': {e}")
-        return []
 
 
 async def _download_image(client: httpx.AsyncClient, url: str, dest: str) -> bool:
@@ -315,10 +229,10 @@ async def _download_image(client: httpx.AsyncClient, url: str, dest: str) -> boo
             with open(dest, "wb") as f:
                 f.write(r.content)
             return True
-        logger.warning(f"[Download] Bad response {r.status_code} or tiny payload ({len(r.content)}B) for {url[:80]}")
+        logger.warning(f"[Download] Bad response {r.status_code} or tiny payload ({len(r.content)}B)")
         return False
     except Exception as e:
-        logger.warning(f"[Download] Failed {url[:80]}: {e}")
+        logger.warning(f"[Download] Failed: {e}")
         return False
 
 
@@ -346,37 +260,75 @@ def _run_ffmpeg_sync(job_id, image_paths, audio_bytes, output_path):
         audio_path = os.path.join(tmp, "audio.wav")
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
+        
+        # Probe audio duration
+        audio_duration = 20.0  # default fallback
         try:
             probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
                 capture_output=True, text=True, timeout=15
             )
-            duration = float(probe.stdout.strip())
+            audio_duration = float(probe.stdout.strip())
+            logger.info(f"[FFmpeg/{job_id}] Audio duration: {audio_duration:.2f}s")
         except Exception as e:
-            logger.warning(f"[FFmpeg/{job_id}] ffprobe failed: {e}, using 20s")
-            duration = 20.0
+            logger.warning(f"[FFmpeg/{job_id}] ffprobe failed: {e}, using default {audio_duration}s")
 
-        dur_per_img = max(duration / len(image_paths), 2.0)
+        # Calculate duration per image
+        # Ensure minimum duration per image and minimum total video duration
+        num_images = len(image_paths)
+        dur_per_img = max(audio_duration / num_images, MIN_DURATION_PER_IMAGE)
+        
+        # If calculated duration is too short, extend it
+        total_video_duration = dur_per_img * num_images
+        if total_video_duration < MIN_VIDEO_DURATION:
+            dur_per_img = MIN_VIDEO_DURATION / num_images
+            total_video_duration = MIN_VIDEO_DURATION
+            logger.info(f"[FFmpeg/{job_id}] Extended video duration to {total_video_duration:.2f}s (minimum)")
+        
+        logger.info(f"[FFmpeg/{job_id}] Duration per image: {dur_per_img:.2f}s, Total: {total_video_duration:.2f}s")
+
+        # Create concat file
         concat = os.path.join(tmp, "concat.txt")
         with open(concat, "w") as f:
             for p in image_paths:
                 f.write(f"file '{p}'\n")
                 f.write(f"duration {dur_per_img:.2f}\n")
+            # FFmpeg concat demuxer requires the last file to be listed again
             f.write(f"file '{image_paths[-1]}'\n")
 
+        # FFmpeg command - DON'T use -shortest if we want the video to be longer than audio
         cmd = [
             "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", concat, "-i", audio_path,
+            "-f", "concat", "-safe", "0", "-i", concat,
+            "-i", audio_path,
             "-vf", f"scale={FFMPEG_RESOLUTION}:force_original_aspect_ratio=decrease,pad={FFMPEG_RESOLUTION}:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
             "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
             "-c:a", "aac", "-b:a", "96k",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-shortest", "-r", "24",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-r", "24",
             output_path,
         ]
+        
+        logger.info(f"[FFmpeg/{job_id}] Starting FFmpeg render...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+        
         if result.returncode != 0:
+            logger.error(f"[FFmpeg/{job_id}] STDERR: {result.stderr[-1000:]}")
             raise RuntimeError(f"FFmpeg failed: {result.stderr[-500:]}")
-        logger.info(f"[FFmpeg/{job_id}] Done: {os.path.getsize(output_path):,} bytes")
+        
+        output_size = os.path.getsize(output_path)
+        logger.info(f"[FFmpeg/{job_id}] Done: {output_size:,} bytes")
+        
+        # Verify output duration
+        try:
+            verify = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output_path],
+                capture_output=True, text=True, timeout=15
+            )
+            output_duration = float(verify.stdout.strip())
+            logger.info(f"[FFmpeg/{job_id}] Output video duration: {output_duration:.2f}s")
+        except Exception:
+            pass
 
 
 async def _upload_supabase(local_path: str, job_id: str) -> str:
